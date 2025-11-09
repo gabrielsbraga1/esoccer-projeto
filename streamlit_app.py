@@ -3,17 +3,16 @@ import numpy as np
 import pandas as pd
 
 # --- Configurações Iniciais ---
-st.set_page_config(layout="wide", page_title="Calculadora de Odd Value para Futebol Virtual")
+st.set_page_config(layout="wide", page_title="Calculadora de Odd Value para Futebol Virtual HT")
 
 # --- Constantes do Modelo Heurístico (Ajuste a seu critério) ---
 # Fatores de impacto nos Gols Esperados (Expected Goals - EG) para um único evento
 PESOS = {
-    'CHUTE_GOL': 0.15,          # Alto impacto, agora atribuído diretamente ao time
-    'ATAQUE_PERIGOSO': 0.05,    # Impacto médio (distribuído pela força inicial)
-    'ESCANTEIO': 0.02           # Baixo impacto (distribuído pela força inicial)
+    'CHUTE_GOL': 0.15,          # Impacto do chute no EG
+    'ATAQUE_PERIGOSO': 0.05,    # Impacto do volume de jogo
+    'ESCANTEIO': 0.02           # Impacto do escanteio
 }
-# Linha de Gols para Análise de Over/Under
-LINHA_GOL = 2.5
+MAX_MINUTO_HT = 6 # Limite máximo para o primeiro tempo virtual
 
 # --- Funções do Modelo ---
 
@@ -30,7 +29,8 @@ def inicializar_estado():
         st.session_state.eg_casa = 0.0
         st.session_state.eg_fora = 0.0
         st.session_state.eg_total = 0.0
-        st.session_state.odd_live_aposta = 2.0 # Valor inicial para aposta live
+        st.session_state.odd_live_aposta = 2.0 
+        st.session_state.linha_gol_selecionada = 2.5 
 
 
 def calcular_probabilidade_inicial(odd):
@@ -41,33 +41,36 @@ def calcular_probabilidade_inicial(odd):
 
 def calcular_eg_base(prob_win):
     """Calcula um EG base inicial a partir da probabilidade de vitória (Simplificação)."""
-    # Se a probabilidade de vitória for 0.5 (odd 2.0), EG_Base será 1.0.
     return 2.0 * prob_win
 
-def calcular_odd_justa_over(eg_total, minuto_atual, linha=LINHA_GOL):
+def calcular_odd_justa_over(eg_total, minuto_atual, linha):
     """
-    Calcula a probabilidade do Over X.5 gols usando uma simplificação do modelo de Poisson.
-    Ajusta pelo tempo restante.
+    Calcula a probabilidade e a Odd Justa para o Over X.5 gols, ajustado pelo tempo restante.
     """
-    if minuto_atual == 0:
+    # Usamos o minuto atual como o minuto em que a análise está sendo feita (e o tempo já passou)
+    minuto_para_ajuste = minuto_atual - 1 if minuto_atual > 0 else 0
+
+    if minuto_para_ajuste >= 6: # Se passou dos 6 minutos (fim do HT), o fator de tempo é 0
+        tempo_restante_fator = 0.0
+    elif minuto_para_ajuste == 0:
         tempo_restante_fator = 1.0
     else:
-        # Fator de ajuste baseado no tempo total de 90 minutos
-        tempo_restante_fator = (90 - minuto_atual) / 90.0
+        # Fator de ajuste baseado no tempo total de 90 minutos do jogo real
+        # Este fator simula a depreciação do EG pelo tempo que falta no jogo total
+        tempo_restante_fator = (90 - minuto_para_ajuste) / 90.0
         
     eg_total_ajustado = eg_total * tempo_restante_fator
     
-    # Heurística para Over 2.5
-    if linha == 2.5:
-        # Fórmula sigmóide simples para transformar EG em probabilidade Over
-        prob_over = 1 / (1 + np.exp(-(eg_total_ajustado - 2.5) * 1.5))
-        prob_over = np.clip(prob_over, 0.05, 0.95)
-    else: 
+    # Heurística Sigmóide: Transforma EG Total Ajustado em probabilidade Over
+    # O '1.5' é um fator de sensibilidade.
+    try:
         prob_over = 1 / (1 + np.exp(-(eg_total_ajustado - linha) * 1.5))
-        prob_over = np.clip(prob_over, 0.05, 0.95)
+        prob_over = np.clip(prob_over, 0.01, 0.99)
+    except OverflowError:
+        prob_over = 0.99 # Caso o EG seja muito alto
 
-    if prob_over == 0:
-        return 0, 0
+    if prob_over < 0.01:
+        return 100.0, 0.0
         
     odd_justa_over = 1 / prob_over
     return odd_justa_over, prob_over
@@ -84,7 +87,7 @@ def iniciar_jogo(odd_casa, odd_empate, odd_fora):
     # Resetar estados para iniciar um novo jogo
     st.session_state.gols_casa = 0
     st.session_state.gols_fora = 0
-    st.session_state.minuto_atual = 0
+    st.session_state.minuto_atual = 1 # O próximo evento será no Minuto 1
     st.session_state.eventos_registrados = []
 
     # Cálculo das Probabilidades
@@ -93,11 +96,11 @@ def iniciar_jogo(odd_casa, odd_empate, odd_fora):
     
     soma_p = p_casa + calcular_probabilidade_inicial(odd_empate) + p_fora
     
-    # Normaliza (para desconsiderar a margem da casa de apostas)
+    # Normaliza
     p_casa_norm = p_casa / soma_p
     p_fora_norm = p_fora / soma_p
 
-    # Atribui EG Base inicial (Simplificação Crua)
+    # Atribui EG Base inicial 
     eg_casa_base = calcular_eg_base(p_casa_norm)
     eg_fora_base = calcular_eg_base(p_fora_norm)
     
@@ -110,13 +113,16 @@ def iniciar_jogo(odd_casa, odd_empate, odd_fora):
     st.session_state.eg_total = eg_casa_base + eg_fora_base
     
     st.session_state.jogo_iniciado = True
-    st.session_state.minuto_atual = 1 # Inicia o jogo no Minuto 1
 
 def registrar_evento(minuto, chutes_casa, chutes_fora, ataques, escanteios, gols_casa, gols_fora):
     """Processa eventos de um minuto e atualiza o estado do jogo."""
     
-    if minuto <= st.session_state.minuto_atual:
-        st.error(f"O minuto deve ser superior ao minuto atual ({st.session_state.minuto_atual - 1}).")
+    if minuto != st.session_state.minuto_atual:
+        st.error(f"O minuto a ser registrado deve ser o Minuto {st.session_state.minuto_atual}.")
+        return
+
+    if minuto > MAX_MINUTO_HT:
+        st.warning(f"O primeiro tempo virtual já terminou (Max: Minuto {MAX_MINUTO_HT}).")
         return
 
     # Distribui o impacto pela Força Relativa (EG atual) para eventos genéricos
@@ -151,130 +157,142 @@ def registrar_evento(minuto, chutes_casa, chutes_fora, ataques, escanteios, gols
     st.session_state.eg_total = st.session_state.eg_casa + st.session_state.eg_fora
     
     # 4. Registra no Histórico
-    odd_minuto, prob_minuto = calcular_odd_justa_over(st.session_state.eg_total, minuto)
+    odd_minuto, prob_minuto = calcular_odd_justa_over(st.session_state.eg_total, minuto, st.session_state.linha_gol_selecionada)
     
     st.session_state.eventos_registrados.append({
         'Minuto': minuto,
         'Placar': f"{st.session_state.gols_casa} x {st.session_state.gols_fora}",
         'Cht C/F': f"{chutes_casa}/{chutes_fora}",
-        'Atq': ataques,
+        'Atq P': ataques,
         'Esc': escanteios,
-        'EG Acumulado': f"{st.session_state.eg_total:.2f}",
-        'Odd Justa': f"{odd_minuto:.2f}"
+        'EG Total': f"{st.session_state.eg_total:.2f}",
+        f'Odd Justa O{st.session_state.linha_gol_selecionada}': f"{odd_minuto:.2f}"
     })
     
-    st.toast("Evento registrado e Odds recalculadas!", icon="⚽")
+    st.toast(f"Evento do Minuto {minuto} registrado e Odds recalculadas!", icon="⚽")
 
 
 # --- Inicialização e Layout ---
 
 inicializar_estado()
 
-st.title("⚽ Odd Value Dinâmico (Futebol Virtual)")
-st.caption("Calculadora em Tempo Real: Recalcula a tendência minuto a minuto.")
+linha_options = [0.5, 1.5, 2.5]
+
+st.title("⚽ Odd Value Dinâmico HT (Futebol Virtual)")
+st.caption(f"Análise e Recálculo em tempo real (Minuto 1 ao {MAX_MINUTO_HT}).")
 
 # --- Seção 1: Configuração Inicial (Sidebar) ---
 with st.sidebar:
     st.header("Configuração Inicial (Pré-jogo)")
     
     if st.session_state.jogo_iniciado:
-        st.success("Jogo Iniciado!")
+        st.success(f"Jogo Iniciado! Próximo registro: Minuto {st.session_state.minuto_atual}")
     
     col1_s, col2_s, col3_s = st.columns(3)
     odd_casa = col1_s.number_input("Odd Inicial (Casa)", min_value=1.01, value=2.20, step=0.01, key="odd_c")
     odd_empate = col2_s.number_input("Odd Inicial (Empate)", min_value=1.01, value=3.20, step=0.01, key="odd_e")
     odd_fora = col3_s.number_input("Odd Inicial (Fora)", min_value=1.01, value=3.20, step=0.01, key="odd_f")
     
-    if st.button("▶️ Iniciar Jogo e Calcular Força Base", key="btn_iniciar"):
+    if st.button("▶️ Iniciar Novo Jogo", key="btn_iniciar"):
         iniciar_jogo(odd_casa, odd_empate, odd_fora)
 
 # --- Seção 2: Jogo em Andamento ---
 
 if st.session_state.jogo_iniciado:
     
-    minuto_jogo = st.session_state.minuto_atual - 1
+    minuto_analisado = st.session_state.minuto_atual - 1
     
-    st.header(f"Minuto de Análise: {minuto_jogo}")
+    # --- Seletor de Linha de Gols e Métricas de Resumo ---
+    col_line, col_score, col_eg = st.columns([1, 1, 1])
     
-    # --- Métricas de Resumo ---
-    col_score, col_eg, col_prob = st.columns(3)
+    linha_selecionada = col_line.selectbox(
+        "Selecione a Linha de Gols para Análise",
+        options=linha_options,
+        index=1, # Começa em 1.5
+        key="linha_gol_select"
+    )
+    st.session_state.linha_gol_selecionada = linha_selecionada
     
     col_score.metric(
-        label="Placar (Casa x Fora)",
+        label="Placar Atual (C x F)",
         value=f"{st.session_state.gols_casa} x {st.session_state.gols_fora}"
     )
     
     col_eg.metric(
-        label="EG Total Acumulado (Expected Goals)",
-        value=f"{st.session_state.eg_total:.2f} Gols"
+        label="EG Total Acumulado",
+        value=f"{st.session_state.eg_total:.2f}"
     )
-    
-    odd_justa_atual, prob_justa_atual = calcular_odd_justa_over(st.session_state.eg_total, minuto_jogo)
-    
-    col_prob.metric(
-        label=f"Prob. Justa Over {LINHA_GOL} (%)",
-        value=f"{prob_justa_atual * 100:.1f}%"
-    )
+
 
     st.subheader(f"Registro de Eventos no Minuto {st.session_state.minuto_atual}")
     
-    with st.form("registro_eventos"):
-        
-        # Minuto e Odd Live
-        col_m, col_odd_live = st.columns(2)
-        minuto_novo = col_m.number_input(
-            f"Minuto a ser Registrado (Atual: {st.session_state.minuto_atual})", 
-            min_value=st.session_state.minuto_atual, 
-            max_value=90, 
-            value=st.session_state.minuto_atual
-        )
-        
-        live_odd_aposta = col_odd_live.number_input(
-            f"Odd Live da Casa (Over {LINHA_GOL} Gols)", 
-            min_value=1.01, 
-            value=st.session_state.odd_live_aposta, 
-            step=0.01,
-            key="live_odd_input_form"
-        )
-        # Atualiza a odd live para o próximo ciclo
-        st.session_state.odd_live_aposta = live_odd_aposta
-        
-        st.markdown("---")
-        st.markdown("#### Eventos de Ataque")
-        col_cht_c, col_cht_f, col_atq, col_esc = st.columns(4)
-        
-        chutes_casa = col_cht_c.number_input("Chutes a Gol (Casa)", min_value=0, value=0, step=1)
-        chutes_fora = col_cht_f.number_input("Chutes a Gol (Visitante)", min_value=0, value=0, step=1)
-        ataques_perigosos = col_atq.number_input("Ataques Perigosos", min_value=0, value=0, step=1)
-        escanteios = col_esc.number_input("Escanteios", min_value=0, value=0, step=1)
-        
-        st.markdown("#### Gols Marcados")
-        col_gol_casa, col_gol_fora = st.columns(2)
-        
-        gols_casa = col_gol_casa.number_input("Gols do Time Casa (+)", min_value=0, value=0, step=1)
-        gols_fora = col_gol_fora.number_input("Gols do Time Fora (+)", min_value=0, value=0, step=1)
-        
-        if st.form_submit_button("🔁 Recalcular Tendência (Registrar Evento)"):
-            registrar_evento(minuto_novo, chutes_casa, chutes_fora, ataques_perigosos, escanteios, gols_casa, gols_fora)
+    if st.session_state.minuto_atual > MAX_MINUTO_HT:
+        st.warning(f"O primeiro tempo virtual terminou no Minuto {MAX_MINUTO_HT}. Reinicie para um novo jogo.")
+    else:
+        with st.form("registro_eventos"):
+            
+            # Minuto e Odd Live
+            col_m, col_odd_live = st.columns(2)
+            
+            minuto_registro = col_m.number_input(
+                "Minuto a ser Registrado", 
+                min_value=st.session_state.minuto_atual, 
+                max_value=MAX_MINUTO_HT, 
+                value=st.session_state.minuto_atual,
+                disabled=True # Força o avanço sequencial
+            )
+            
+            live_odd_aposta = col_odd_live.number_input(
+                f"Odd Live da Casa (Over {linha_selecionada})", 
+                min_value=1.01, 
+                value=st.session_state.odd_live_aposta, 
+                step=0.01,
+                key="live_odd_input_form"
+            )
+            # Armazena o último input de odd para o próximo ciclo
+            st.session_state.odd_live_aposta = live_odd_aposta
+            
+            st.markdown("---")
+            st.markdown("#### Eventos de Ataque")
+            col_cht_c, col_cht_f, col_atq, col_esc = st.columns(4)
+            
+            chutes_casa = col_cht_c.number_input("Chutes a Gol (Casa)", min_value=0, value=0, step=1)
+            chutes_fora = col_cht_f.number_input("Chutes a Gol (Visitante)", min_value=0, value=0, step=1)
+            ataques_perigosos = col_atq.number_input("Ataques Perigosos", min_value=0, value=0, step=1)
+            escanteios = col_esc.number_input("Escanteios", min_value=0, value=0, step=1)
+            
+            st.markdown("#### Gols Marcados")
+            col_gol_casa, col_gol_fora = st.columns(2)
+            
+            gols_casa = col_gol_casa.number_input("Gols do Time Casa (+)", min_value=0, value=0, step=1)
+            gols_fora = col_gol_fora.number_input("Gols do Time Fora (+)", min_value=0, value=0, step=1)
+            
+            if st.form_submit_button("🔁 Recalcular Tendência e Registrar"):
+                registrar_evento(minuto_registro, chutes_casa, chutes_fora, ataques_perigosos, escanteios, gols_casa, gols_fora)
 
     st.markdown("---")
-    st.subheader(f"📊 Análise de Odd Value (Over {LINHA_GOL}) no Minuto {minuto_jogo}")
+    st.subheader(f"📊 Análise de Odd Value para Over {linha_selecionada} Gols")
+    
+    # Recalcula a Odd Justa e Probabilidade no estado ATUAL (antes do registro do próximo minuto)
+    odd_justa_atual, prob_justa_atual = calcular_odd_justa_over(st.session_state.eg_total, minuto_analisado, linha_selecionada)
     
     if odd_justa_atual > 0:
         
         # Cálculo do Valor (Value)
-        value_ratio = live_odd_aposta / odd_justa_atual
+        value_ratio = st.session_state.odd_live_aposta / odd_justa_atual
         
-        col_justa, col_aposta, col_value = st.columns(3)
+        col_prob, col_justa, col_value = st.columns(3)
+        
+        col_prob.metric(
+            label=f"Prob. Justa Over {linha_selecionada} (%)",
+            value=f"{prob_justa_atual * 100:.1f}%"
+        )
         
         col_justa.metric(
-            label=f"Odd Justa (Fair Odd) Over {LINHA_GOL}",
-            value=f"{odd_justa_atual:.2f}"
-        )
-
-        col_aposta.metric(
-            label=f"Sua Odd de Aposta",
-            value=f"{live_odd_aposta:.2f}"
+            label=f"Odd Justa/Esperada",
+            value=f"{odd_justa_atual:.2f}",
+            delta=f"Live Odd: {st.session_state.odd_live_aposta:.2f}",
+            delta_color="off" # A cor será definida no bloco Value
         )
         
         # Interpretação do Odd Value
@@ -282,7 +300,7 @@ if st.session_state.jogo_iniciado:
             value_status = "✅ Forte Valor! (Value)"
             color = "#10B981" # Green
         elif value_ratio > 1.01:
-            value_status = "🟡 Pequeno Valor Encontrado"
+            value_status = "🟡 Pequeno Valor"
             color = "#F59E0B" # Yellow/Orange
         else:
             value_status = "❌ Sem Valor (No Value)"
@@ -290,7 +308,7 @@ if st.session_state.jogo_iniciado:
             
         col_value.markdown(
             f"""
-            <div style='background-color: {color}; padding: 15px; border-radius: 8px; color: white; text-align: center; height: 100%'>
+            <div style='background-color: {color}; padding: 15px; border-radius: 8px; color: white; text-align: center; height: 100%; display: flex; flex-direction: column; justify-content: center;'>
                 <h4 style='margin-top: 0; font-size: 1.2em;'>Odd Value Ratio</h4>
                 <p style='font-size: 2em; margin: 0;'>**{value_ratio:.2f}**</p>
                 <p style='margin: 0; font-weight: bold;'>{value_status}</p>
@@ -299,16 +317,13 @@ if st.session_state.jogo_iniciado:
         )
 
         st.markdown("---")
-        st.subheader("Histórico Detalhado (Eventos Registrados)")
+        st.subheader("Histórico de Eventos Registrados")
         if st.session_state.eventos_registrados:
-            # Exibir a tabela de histórico de eventos
             df_historico = pd.DataFrame(st.session_state.eventos_registrados)
             st.dataframe(df_historico, use_container_width=True)
-        else:
-            st.info("Nenhum evento registrado ainda.")
-            
+        
     else:
-        st.warning("Odd Justa não calculada. Registre o primeiro evento para iniciar a análise.")
+        st.info("Inicie o jogo e registre o primeiro minuto para ver a análise de Odd Value.")
         
 else:
     st.info("Aguardando a inserção das odds iniciais para começar.")
